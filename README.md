@@ -15,7 +15,7 @@ SSHAutomator is a high-performance Go program that provides concurrent execution
 ## Installation
 
 ```bash
-go install github.com/yourusername/SSHAutomator@latest
+go install github.com/gokusan92/SSHAutomator@latest
 ```
 
 ## Usage
@@ -112,7 +112,7 @@ Contributions are welcome! Please feel free to submit a Pull Request. For major 
 
 1. Clone the repository
 ```bash
-git clone https://github.com/yourusername/SSHAutomator.git
+git clone https://github.com/gokusan92/SSHAutomator.git
 ```
 
 2. Install dependencies
