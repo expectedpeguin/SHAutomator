@@ -1,117 +1,113 @@
 package main
 
 import (
-	"SSHAutomator/internal/sshhandler"
-	"flag"
+	"context"
 	"fmt"
-	"golang.org/x/crypto/ssh"
+	"log"
 	"os"
+	"os/signal"
+	"sync"
+
+	"SSHAutomator/internal/config"
+	"SSHAutomator/internal/executor"
+	"SSHAutomator/internal/sshhandler"
 )
 
 func main() {
-	hostPtr := flag.String("host", "", "SSH host")
-	portPtr := flag.Int("port", 22, "SSH port")
-	usernamePtr := flag.String("username", "", "SSH username")
-	passwordPtr := flag.String("password", "", "SSH password")
-	keyFilePtr := flag.String("keyfile", "", "Path to private key file (optional)")
-	scriptFilePtr := flag.String("script", "", "Path of the script you would like to run")
-	serversFilePtr := flag.String("servers", "", "File containing server details")
-	flag.Parse()
+	cfg := config.ParseFlags()
 
-	commands, err := sshhandler.ReadScriptFile(*scriptFilePtr)
+	// Setup logging
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
+	// Create context with cancellation
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Handle OS signals
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt)
+	go func() {
+		<-sigChan
+		cancel()
+	}()
+
+	// Read commands
+	commands, err := sshhandler.ReadScriptFile(cfg.ScriptFile)
 	if err != nil {
-		fmt.Println("Error reading specified file:", err)
-		return
+		log.Fatalf("Error reading script file: %v", err)
 	}
 
-	var servers []sshhandler.ServerDetails
-	if *serversFilePtr != "" {
-		var err error
-		servers, err = sshhandler.ReadServersFile(*serversFilePtr)
-		if err != nil {
-			fmt.Println("Error reading servers file:", err)
-			return
-		}
-	} else {
-		if *hostPtr == "" || *usernamePtr == "" {
-			fmt.Println("Usage: shautomator -script script.shautomator -host HOST -port PORT -username USERNAME [-password PASSWORD | -keyfile KEYFILE]")
-			fmt.Println("Usage: shautomator -script script.shautomator -servers serverlist.txt")
-			return
-		}
-		servers = append(servers, sshhandler.ServerDetails{
-			Host:     *hostPtr,
-			Username: *usernamePtr,
-			Password: *passwordPtr,
-			KeyFile:  *keyFilePtr,
-		})
-		err = executeSSHCommands(*hostPtr, *portPtr, *usernamePtr, *passwordPtr, *keyFilePtr, commands)
-		if err != nil {
-			fmt.Println("Command execution failed:", err)
-		}
-	}
-
-	commands, err = sshhandler.ReadScriptFile(*scriptFilePtr)
+	// Get server details
+	servers, err := getServers(cfg)
 	if err != nil {
-		fmt.Println("Error reading specified file:", err)
-		return
+		log.Fatalf("Error getting server details: %v", err)
 	}
 
-	for _, server := range servers {
-		go func(server sshhandler.ServerDetails) {
-			err := executeSSHCommands(server.Host, *portPtr, server.Username, server.Password, server.KeyFile, commands)
-			if err != nil {
-				fmt.Printf("Command execution failed on %s: %v\n", server.Host, err)
-			}
-		}(server)
+	// Execute commands
+	if err := executeCommands(ctx, cfg, servers, commands); err != nil {
+		log.Fatalf("Error executing commands: %v", err)
 	}
-
-	fmt.Println("Commands execution initiated on specified servers.")
-	fmt.Println("Waiting for commands to complete...")
-	fmt.Scanln()
 }
 
-func executeSSHCommands(host string, port int, username, password, keyFile string, commands []string) error {
-	config := &ssh.ClientConfig{
-		User:            username,
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+func getServers(cfg *config.Config) ([]sshhandler.ServerDetails, error) {
+	if cfg.ServersFile != "" {
+		return sshhandler.ReadServersFile(cfg.ServersFile)
 	}
 
-	auth, err := sshhandler.GetAuthMethod(password, keyFile)
-	if err != nil {
-		return err
-	}
-	config.Auth = []ssh.AuthMethod{auth}
-
-	sshClient, err := ssh.Dial("tcp", fmt.Sprintf("%s:%d", host, port), config)
-	if err != nil {
-		return err
-	}
-	defer sshClient.Close()
-
-	session, err := sshClient.NewSession()
-	if err != nil {
-		return err
-	}
-	defer session.Close()
-
-	session.Stdout = os.Stdout
-	session.Stderr = os.Stderr
-
-	stdin, err := session.StdinPipe()
-	if err != nil {
-		return err
+	if cfg.Host == "" || cfg.Username == "" {
+		return nil, fmt.Errorf("host and username are required when not using servers file")
 	}
 
-	if err := session.Shell(); err != nil {
-		return err
+	return []sshhandler.ServerDetails{{
+		Host:     cfg.Host,
+		Port:     cfg.Port,
+		Username: cfg.Username,
+		Password: cfg.Password,
+		KeyFile:  cfg.KeyFile,
+	}}, nil
+}
+
+func executeCommands(ctx context.Context, cfg *config.Config, servers []sshhandler.ServerDetails, commands []string) error {
+	var wg sync.WaitGroup
+	errChan := make(chan error, len(servers))
+
+	// Create execution pool
+	pool := executor.NewPool(ctx, cfg.MaxConcurrent)
+
+	// Execute commands for each server
+	for _, server := range servers {
+		wg.Add(1)
+		server := server // Create new variable for goroutine
+
+		pool.Submit(func() {
+			defer wg.Done()
+
+			client, err := sshhandler.NewClient(server)
+			if err != nil {
+				errChan <- fmt.Errorf("failed to create SSH client for %s: %v", server.Host, err)
+				return
+			}
+			defer client.Close()
+
+			if err := client.ExecuteCommands(ctx, commands); err != nil {
+				errChan <- fmt.Errorf("command execution failed on %s: %v", server.Host, err)
+			}
+		})
 	}
 
-	for _, cmd := range commands {
-		if _, err := stdin.Write([]byte(cmd + "\n")); err != nil {
-			return err
-		}
+	// Wait for all executions to complete
+	wg.Wait()
+	close(errChan)
+
+	// Collect errors
+	var errors []error
+	for err := range errChan {
+		errors = append(errors, err)
 	}
 
-	return session.Wait()
+	if len(errors) > 0 {
+		return fmt.Errorf("encountered %d errors during execution", len(errors))
+	}
+
+	return nil
 }

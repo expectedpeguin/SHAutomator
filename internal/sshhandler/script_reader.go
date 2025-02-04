@@ -29,13 +29,6 @@ func ReadScriptFile(scriptFile string) ([]string, error) {
 	return commands, nil
 }
 
-type ServerDetails struct {
-	Host     string
-	Username string
-	Password string
-	KeyFile  string
-}
-
 func ReadServersFile(filename string) ([]ServerDetails, error) {
 	file, err := os.Open(filename)
 	if err != nil {
